@@ -1,4 +1,3 @@
-import time
 import requests
 import numpy as np
 import pandas as pd
@@ -82,8 +81,7 @@ def to_daily_df(payload: dict) -> pd.DataFrame:
     return df
 
 def aq_label(pm25: float) -> str:
-    # Proste progi poglądowe (nie udajemy oficjalnej klasyfikacji dla każdego kraju)
-    if pm25 is None or np.isnan(pm25):
+    if pm25 is None or (isinstance(pm25, float) and np.isnan(pm25)):
         return "n/a"
     if pm25 <= 12:
         return "good"
@@ -143,20 +141,17 @@ def render_single(loc_name: str, lat: float, lon: float):
     w_day = to_daily_df(w)
     a_hour = to_hourly_df(a, prefix="aq_")
 
-    df = pd.merge(w_hour, a_hour, on="time", how="left")
-    df = df.sort_values("time")
+    df = pd.merge(w_hour, a_hour, on="time", how="left").sort_values("time")
 
-    # KPI (use latest hour)
     latest = df.dropna(subset=["temperature_2m"]).tail(1)
     if len(latest) == 1:
         t_now = float(latest["temperature_2m"].iloc[0])
-        wind_now = float(latest["windspeed_10m"].iloc[0])
-        rain_now = float(latest["precipitation"].iloc[0])
+        wind_now = float(latest["windspeed_10m"].iloc[0]) if "windspeed_10m" in latest.columns else np.nan
+        rain_now = float(latest["precipitation"].iloc[0]) if "precipitation" in latest.columns else np.nan
         pm25_now = latest["aq_pm2_5"].iloc[0] if "aq_pm2_5" in latest.columns else np.nan
-        pm10_now = latest["aq_pm10"].iloc[0] if "aq_pm10" in latest.columns else np.nan
     else:
         t_now = wind_now = rain_now = np.nan
-        pm25_now = pm10_now = np.nan
+        pm25_now = np.nan
 
     with colA:
         st.subheader(f"📍 {loc_name}  ({lat:.4f}, {lon:.4f})")
@@ -168,16 +163,13 @@ def render_single(loc_name: str, lat: float, lon: float):
         m4.metric("PM2.5 (latest)", f"{pm25_now:.1f} µg/m³" if np.isfinite(pm25_now) else "n/a")
         m5.metric("AQ status", aq_label(pm25_now) if np.isfinite(pm25_now) else "n/a")
 
-        # Temperature chart
         fig_t = px.line(df, x="time", y="temperature_2m", title="Temperature (hourly)")
         st.plotly_chart(fig_t, use_container_width=True)
 
-        # Precip chart
         fig_p = px.bar(df, x="time", y="precipitation", title="Precipitation (hourly)")
         st.plotly_chart(fig_p, use_container_width=True)
 
     with colB:
-        # Daily summary
         st.subheader("📅 Daily summary")
         if len(w_day) > 0:
             fig_d = px.line(
@@ -214,7 +206,6 @@ def render_compare(locations: list[str]):
             a_hour = to_hourly_df(a, prefix="aq_")
             df = pd.merge(w_hour, a_hour, on="time", how="left").sort_values("time")
 
-            # latest snapshot
             latest = df.dropna(subset=["temperature_2m"]).tail(1)
             if len(latest) == 1:
                 t_now = float(latest["temperature_2m"].iloc[0])
@@ -242,15 +233,15 @@ def render_compare(locations: list[str]):
                 "location": name,
                 "weather_hours": int(len(w_hour)),
                 "aq_hours": int(len(a_hour)),
-                "missing_temp": int(w_hour["temperature_2m"].isna().sum()) if "temperature_2m" in w_hour else None,
-                "missing_pm25": int(a_hour["aq_pm2_5"].isna().sum()) if "aq_pm2_5" in a_hour else None,
+                "missing_temp": int(w_hour["temperature_2m"].isna().sum()) if "temperature_2m" in w_hour.columns else None,
+                "missing_pm25": int(a_hour["aq_pm2_5"].isna().sum()) if "aq_pm2_5" in a_hour.columns else None,
             })
 
-    kpi = pd.DataFrame(rows).sort_values("temp_latest_c", ascending=False)
+    kpi_df = pd.DataFrame(rows).sort_values("temp_latest_c", ascending=False)
     map_df = pd.DataFrame(map_rows)
     meta_df = pd.DataFrame(meta)
 
-    return kpi, map_df, meta_df
+    return kpi_df, map_df, meta_df
 
 # -----------------------------
 # Tabs content
@@ -262,12 +253,16 @@ if mode == "Single location":
         st.write("Wybierz zakładki **Map / Air Quality / Data Quality / Table & Export** dla dodatkowych widoków.")
 
     with tabs[1]:
-        st.subheader("🗺️ Map (points + hexbin)")
-        # Sample for speed
+        st.subheader("🗺️ Map (punkt: najnowsza obserwacja)")
         d = df_all.dropna(subset=["temperature_2m"]).copy()
         if len(d) > 0:
-            d = d.tail(1)  # single point (latest) for this location
-        map_df = pd.DataFrame([{"lat": lat, "lon": lon, "temp": d["temperature_2m"].iloc[0] if len(d) else np.nan}])
+            d = d.tail(1)
+
+        map_df = pd.DataFrame([{
+            "lat": lat,
+            "lon": lon,
+            "temp": float(d["temperature_2m"].iloc[0]) if len(d) else np.nan
+        }])
 
         layer = pdk.Layer(
             "ScatterplotLayer",
@@ -278,7 +273,8 @@ if mode == "Single location":
             pickable=True,
         )
         view_state = pdk.ViewState(latitude=lat, longitude=lon, zoom=8)
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "Temp: {temp}°C"}))
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state,
+                                 tooltip={"text": "Temp: {temp}°C"}))
 
     with tabs[2]:
         st.subheader("🫁 Air Quality (hourly)")
@@ -293,8 +289,8 @@ if mode == "Single location":
 
     with tabs[3]:
         st.subheader("🧪 Data Quality & Engineering")
-        st.write("**Caching:** dane pogodowe TTL 30 min, dane AQ TTL 60 min.")
-        st.write("**Walidacja:** odfiltrowane wartości puste; zakresy opadów i czasu pozostają zgodne z API.")
+        st.write("**Caching:** weather TTL 30 min, air quality TTL 60 min (`st.cache_data`).")
+        st.write("**Walidacja:** parsowanie czasu, merge po `time`, brakujące AQ → NaN/0 nie jest wymuszane.")
         st.json({
             "weather_keys": list(w_payload.keys()),
             "air_quality_keys": list(a_payload.keys())
@@ -307,33 +303,86 @@ if mode == "Single location":
         st.download_button("Download CSV", csv, file_name=f"weather_aq_{loc_name}.csv", mime="text/csv")
 
 else:
+    # ✅ KLUCZOWA ZMIANA: liczymy raz, potem używamy w wielu tabach
+    kpi_df, map_df, meta_df = render_compare(selected)
+
     with tabs[0]:
-        map_df = render_compare(selected)
+        st.subheader("📊 Latest snapshot")
+        st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+
+        st.subheader("📈 Temperature comparison (hourly)")
+        series = []
+        for name in selected:
+            lat, lon = DEFAULT_LOCATIONS[name]
+            w = fetch_weather(lat, lon, tz, days)
+            w_hour = to_hourly_df(w, prefix="")
+            w_hour["location"] = name
+            series.append(w_hour[["time", "location", "temperature_2m"]])
+
+        comp = pd.concat(series, ignore_index=True)
+        fig = px.line(comp, x="time", y="temperature_2m", color="location")
+        st.plotly_chart(fig, use_container_width=True)
 
     with tabs[1]:
-        st.subheader("🗺️ Map: compare locations (color by temperature, tooltip includes PM2.5)")
-        map_df = map_df.dropna(subset=["lat", "lon"]).copy()
+        st.subheader("🗺️ Map: compare locations (tooltip: temp + PM2.5)")
+        m = map_df.dropna(subset=["lat", "lon"]).copy()
 
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=map_df,
-            get_position="[lon, lat]",
-            get_radius=80000,
-            get_fill_color="[200, 30, 0, 160]",
-            pickable=True,
-        )
-        view_state = pdk.ViewState(latitude=float(map_df["lat"].mean()), longitude=float(map_df["lon"].mean()), zoom=2.2)
-        st.pydeck_chart(
-            pdk.Deck(layers=[layer], initial_view_state=view_state,
-                     tooltip={"text": "{location}\nTemp: {temp}°C\nPM2.5: {pm25} µg/m³"})
-        )
+        if len(m) == 0:
+            st.warning("Brak punktów do pokazania na mapie (sprawdź API / parametry).")
+        else:
+            layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=m,
+                get_position="[lon, lat]",
+                get_radius=80000,
+                get_fill_color="[200, 30, 0, 160]",
+                pickable=True,
+            )
+            view_state = pdk.ViewState(
+                latitude=float(m["lat"].mean()),
+                longitude=float(m["lon"].mean()),
+                zoom=2.2
+            )
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=view_state,
+                    tooltip={"text": "{location}\nTemp: {temp}°C\nPM2.5: {pm25} µg/m³"}
+                )
+            )
 
     with tabs[2]:
-        st.info("W trybie porównawczym AQ jest pokazane w tooltipie mapy + w tabeli snapshot. Możesz rozbudować o wykresy AQ per miasto.")
+        st.subheader("🫁 Air Quality — latest snapshot")
+        st.dataframe(
+            kpi_df[["location", "pm25_latest", "aq_status"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
     with tabs[3]:
         st.subheader("🧪 Data Quality & Engineering")
-        st.write("W trybie porównawczym pobieramy dane per lokalizacja, cachowane według współrzędnych i parametrów (TTL).")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Locations", len(selected))
+        c2.metric("Forecast days", days)
+        c3.metric("Timezone", tz)
+
+        st.markdown("**Cache:** weather TTL 30 min, air quality TTL 60 min (`st.cache_data`).")
+        st.markdown("**Kontrola jakości:** liczba obserwacji hourly i braki (per lokalizacja).")
+        st.dataframe(meta_df, use_container_width=True, hide_index=True)
+
+        with st.expander("Debug (opcjonalnie)"):
+            st.write("Selected locations:", selected)
+            st.write("meta_df shape:", meta_df.shape)
+            st.write("kpi_df shape:", kpi_df.shape)
 
     with tabs[4]:
-        st.info("Export dotyczy widoku single-location. Jeśli chcesz, dopiszę export dla compare-mode (łączenie danych do jednego CSV).")
+        st.subheader("📄 Export (compare snapshot)")
+        st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+        csv = kpi_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download snapshot CSV",
+            csv,
+            file_name="compare_snapshot.csv",
+            mime="text/csv"
+        )

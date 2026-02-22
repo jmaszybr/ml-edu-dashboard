@@ -201,9 +201,12 @@ def render_single(loc_name: str, lat: float, lon: float):
 def render_compare(locations: list[str]):
     rows = []
     map_rows = []
+    meta = []
+
     with st.spinner("Pobieram dane dla wielu lokalizacji..."):
         for name in locations:
             lat, lon = DEFAULT_LOCATIONS[name]
+
             w = fetch_weather(lat, lon, tz, days)
             a = fetch_air(lat, lon, tz)
 
@@ -211,6 +214,7 @@ def render_compare(locations: list[str]):
             a_hour = to_hourly_df(a, prefix="aq_")
             df = pd.merge(w_hour, a_hour, on="time", how="left").sort_values("time")
 
+            # latest snapshot
             latest = df.dropna(subset=["temperature_2m"]).tail(1)
             if len(latest) == 1:
                 t_now = float(latest["temperature_2m"].iloc[0])
@@ -234,24 +238,19 @@ def render_compare(locations: list[str]):
                 "pm25": pm25_now
             })
 
+            meta.append({
+                "location": name,
+                "weather_hours": int(len(w_hour)),
+                "aq_hours": int(len(a_hour)),
+                "missing_temp": int(w_hour["temperature_2m"].isna().sum()) if "temperature_2m" in w_hour else None,
+                "missing_pm25": int(a_hour["aq_pm2_5"].isna().sum()) if "aq_pm2_5" in a_hour else None,
+            })
+
     kpi = pd.DataFrame(rows).sort_values("temp_latest_c", ascending=False)
-    st.subheader("📊 Latest snapshot")
-    st.dataframe(kpi, use_container_width=True, hide_index=True)
+    map_df = pd.DataFrame(map_rows)
+    meta_df = pd.DataFrame(meta)
 
-    # Compare temperature time series
-    st.subheader("📈 Temperature comparison (hourly)")
-    series = []
-    for name in locations:
-        lat, lon = DEFAULT_LOCATIONS[name]
-        w = fetch_weather(lat, lon, tz, days)
-        w_hour = to_hourly_df(w, prefix="")
-        w_hour["location"] = name
-        series.append(w_hour[["time", "location", "temperature_2m"]])
-    comp = pd.concat(series, ignore_index=True)
-    fig = px.line(comp, x="time", y="temperature_2m", color="location")
-    st.plotly_chart(fig, use_container_width=True)
-
-    return pd.DataFrame(map_rows)
+    return kpi, map_df, meta_df
 
 # -----------------------------
 # Tabs content

@@ -1,389 +1,340 @@
-import streamlit as st
+import time
+import requests
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from sklearn.cluster import KMeans
-from sklearn.datasets import make_blobs, make_moons, make_circles
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import pydeck as pdk
 
-st.set_page_config(page_title="🔵 KMeans Explorer", page_icon="🔵", layout="wide")
+st.set_page_config(page_title="Weather & Air Quality Dashboard", layout="wide")
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .main { background-color: #f8f4ff; }
-    h1, h2, h3 { color: #5b2d8e; }
-    .stTabs [data-baseweb="tab"] { font-size: 1rem; font-weight: 600; }
-    .stTabs [aria-selected="true"] { color: #5b2d8e !important; }
-    .info-box {
-        background: #ede7f6; border-left: 4px solid #7b3db5;
-        border-radius: 0 10px 10px 0; padding: 0.8rem 1rem;
-        color: #3d1a6e; font-size: 0.92rem; margin: 0.8rem 0;
+# -----------------------------
+# Open-Meteo endpoints (no key)
+# -----------------------------
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+DEFAULT_LOCATIONS = {
+    "New York City": (40.7128, -74.0060),
+    "Warsaw": (52.2297, 21.0122),
+    "Berlin": (52.5200, 13.4050),
+    "London": (51.5072, -0.1276),
+    "Paris": (48.8566, 2.3522),
+}
+
+def safe_get(url: str, params: dict, timeout: int = 20) -> dict:
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(show_spinner=False, ttl=30 * 60)  # 30 min
+def fetch_weather(lat: float, lon: float, tz: str, days: int) -> dict:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": tz,
+        "forecast_days": days,
+        "hourly": ",".join([
+            "temperature_2m",
+            "relative_humidity_2m",
+            "precipitation",
+            "windspeed_10m",
+            "windgusts_10m",
+            "cloudcover"
+        ]),
+        "daily": ",".join([
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_sum",
+            "windspeed_10m_max"
+        ])
     }
-    .step-box {
-        background: white; border-radius: 12px;
-        padding: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.07);
-        text-align: center; margin-bottom: 0.5rem;
+    return safe_get(WEATHER_URL, params)
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)  # 60 min
+def fetch_air(lat: float, lon: float, tz: str) -> dict:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": tz,
+        "hourly": ",".join(["pm10", "pm2_5", "nitrogen_dioxide", "ozone"])
     }
-    .step-num { font-size: 2rem; font-weight: 700; color: #7b3db5; }
-    .step-label { font-size: 0.8rem; color: #888; text-transform: uppercase; }
-</style>
-""", unsafe_allow_html=True)
+    return safe_get(AIR_URL, params)
 
-# ── Paleta kolorów ────────────────────────────────────────────────────────────
-KOLORY = ["#e63946", "#2a9d8f", "#e9c46a", "#457b9d", "#f4a261", "#a8dadc"]
+def to_hourly_df(payload: dict, prefix: str) -> pd.DataFrame:
+    h = payload.get("hourly", {})
+    t = pd.to_datetime(h.get("time", []))
+    df = pd.DataFrame({"time": t})
+    for k, v in h.items():
+        if k == "time":
+            continue
+        df[f"{prefix}{k}"] = v
+    return df
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🔵 KMeans Explorer")
-    st.markdown("Interaktywna nauka algorytmu K-Means")
-    st.divider()
+def to_daily_df(payload: dict) -> pd.DataFrame:
+    d = payload.get("daily", {})
+    t = pd.to_datetime(d.get("time", []))
+    df = pd.DataFrame({"date": t})
+    for k, v in d.items():
+        if k == "time":
+            continue
+        df[k] = v
+    return df
 
-    st.markdown("### 📐 Dane")
-    typ_danych = st.selectbox("Kształt danych:", [
-        "Kuliste skupiska (blobs)",
-        "Dwa półksiężyce (moons)",
-        "Koncentryczne okręgi (circles)",
-        "Własne dane (losowe)"
-    ])
+def aq_label(pm25: float) -> str:
+    # Proste progi poglądowe (nie udajemy oficjalnej klasyfikacji dla każdego kraju)
+    if pm25 is None or np.isnan(pm25):
+        return "n/a"
+    if pm25 <= 12:
+        return "good"
+    if pm25 <= 35:
+        return "moderate"
+    return "poor"
 
-    n_punktow = st.slider("Liczba punktów:", 50, 500, 200, 50)
+# -----------------------------
+# UI: Sidebar
+# -----------------------------
+st.sidebar.title("⚙️ Ustawienia")
 
-    if typ_danych == "Kuliste skupiska (blobs)":
-        n_true = st.slider("Prawdziwe skupiska:", 2, 6, 3)
-        szum = st.slider("Rozrzut skupisk:", 0.3, 2.5, 1.0, 0.1)
+tz = st.sidebar.selectbox("Timezone", ["auto", "Europe/Warsaw", "America/New_York", "UTC"], index=1)
+if tz == "auto":
+    tz = "UTC"
+
+days = st.sidebar.slider("Forecast days", 1, 16, 7)
+
+mode = st.sidebar.radio("Tryb", ["Single location", "Compare locations"], index=0)
+
+if mode == "Single location":
+    loc_name = st.sidebar.selectbox("Location", list(DEFAULT_LOCATIONS.keys()), index=0)
+    lat, lon = DEFAULT_LOCATIONS[loc_name]
+else:
+    selected = st.sidebar.multiselect(
+        "Locations (2–6)",
+        list(DEFAULT_LOCATIONS.keys()),
+        default=["New York City", "Warsaw", "Berlin"]
+    )
+    if len(selected) < 1:
+        selected = ["New York City"]
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Force refresh (clear cache)"):
+    st.cache_data.clear()
+    st.rerun()
+
+# -----------------------------
+# Header
+# -----------------------------
+st.title("🌦️ Weather & Air Quality Dashboard (API-based)")
+st.caption("Źródła: Open-Meteo Weather Forecast API i Open-Meteo Air Quality API (bez klucza API).")
+
+tabs = st.tabs(["Overview", "Map", "Air Quality", "Data Quality", "Table & Export"])
+
+# -----------------------------
+# Single location view
+# -----------------------------
+def render_single(loc_name: str, lat: float, lon: float):
+    colA, colB = st.columns([1.2, 1])
+
+    with st.spinner("Pobieram dane z API..."):
+        w = fetch_weather(lat, lon, tz, days)
+        a = fetch_air(lat, lon, tz)
+
+    w_hour = to_hourly_df(w, prefix="")
+    w_day = to_daily_df(w)
+    a_hour = to_hourly_df(a, prefix="aq_")
+
+    df = pd.merge(w_hour, a_hour, on="time", how="left")
+    df = df.sort_values("time")
+
+    # KPI (use latest hour)
+    latest = df.dropna(subset=["temperature_2m"]).tail(1)
+    if len(latest) == 1:
+        t_now = float(latest["temperature_2m"].iloc[0])
+        wind_now = float(latest["windspeed_10m"].iloc[0])
+        rain_now = float(latest["precipitation"].iloc[0])
+        pm25_now = latest["aq_pm2_5"].iloc[0] if "aq_pm2_5" in latest.columns else np.nan
+        pm10_now = latest["aq_pm10"].iloc[0] if "aq_pm10" in latest.columns else np.nan
     else:
-        n_true = None
-        szum = st.slider("Szum:", 0.0, 0.3, 0.05, 0.01)
+        t_now = wind_now = rain_now = np.nan
+        pm25_now = pm10_now = np.nan
 
-    st.divider()
-    st.markdown("### ⚙️ KMeans")
-    k = st.slider("Liczba klastrów K:", 2, 8, 3)
-    max_iter = st.slider("Max iteracji:", 1, 20, 10)
-    n_init = st.selectbox("Inicjalizacja centroidów:", ["k-means++", "random"])
+    with colA:
+        st.subheader(f"📍 {loc_name}  ({lat:.4f}, {lon:.4f})")
 
-    st.divider()
-    st.markdown("### 🎬 Animacja kroków")
-    pokaz_kroki = st.checkbox("Pokaż kroki algorytmu", value=True)
-    krok = st.slider("Krok:", 1, max_iter, max_iter) if pokaz_kroki else max_iter
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Temp (latest)", f"{t_now:.1f}°C" if np.isfinite(t_now) else "n/a")
+        m2.metric("Wind (latest)", f"{wind_now:.1f} km/h" if np.isfinite(wind_now) else "n/a")
+        m3.metric("Precip (latest)", f"{rain_now:.1f} mm" if np.isfinite(rain_now) else "n/a")
+        m4.metric("PM2.5 (latest)", f"{pm25_now:.1f} µg/m³" if np.isfinite(pm25_now) else "n/a")
+        m5.metric("AQ status", aq_label(pm25_now) if np.isfinite(pm25_now) else "n/a")
 
-    losuj = st.button("🎲 Losuj nowe dane", use_container_width=True)
+        # Temperature chart
+        fig_t = px.line(df, x="time", y="temperature_2m", title="Temperature (hourly)")
+        st.plotly_chart(fig_t, use_container_width=True)
 
-# ── Generowanie danych ────────────────────────────────────────────────────────
-@st.cache_data
-def generuj_dane(typ, n, szum, n_true, seed):
-    np.random.seed(seed)
-    if typ == "Kuliste skupiska (blobs)":
-        X, y = make_blobs(n_samples=n, centers=n_true, cluster_std=szum, random_state=seed)
-    elif typ == "Dwa półksiężyce (moons)":
-        X, y = make_moons(n_samples=n, noise=szum, random_state=seed)
-    elif typ == "Koncentryczne okręgi (circles)":
-        X, y = make_circles(n_samples=n, noise=szum, factor=0.5, random_state=seed)
-    else:
-        X = np.random.randn(n, 2) * 2
-        y = np.zeros(n, dtype=int)
-    return StandardScaler().fit_transform(X), y
+        # Precip chart
+        fig_p = px.bar(df, x="time", y="precipitation", title="Precipitation (hourly)")
+        st.plotly_chart(fig_p, use_container_width=True)
 
-seed = np.random.randint(0, 9999) if losuj else 42
-X, y_true = generuj_dane(typ_danych, n_punktow, szum,
-                          n_true if n_true else 3, seed)
+    with colB:
+        # Daily summary
+        st.subheader("📅 Daily summary")
+        if len(w_day) > 0:
+            fig_d = px.line(
+                w_day,
+                x="date",
+                y=["temperature_2m_max", "temperature_2m_min"],
+                title="Daily max/min temperature"
+            )
+            st.plotly_chart(fig_d, use_container_width=True)
 
-# ── KMeans krok po kroku ──────────────────────────────────────────────────────
-def kmeans_steps(X, k, max_iter, init):
-    np.random.seed(42)
-    if init == "k-means++":
-        idx = [np.random.randint(len(X))]
-        for _ in range(k - 1):
-            dists = np.min([np.sum((X - X[i])**2, axis=1) for i in idx], axis=0)
-            probs = dists / dists.sum()
-            idx.append(np.random.choice(len(X), p=probs))
-        centroids = X[idx].copy()
-    else:
-        centroids = X[np.random.choice(len(X), k, replace=False)].copy()
+            fig_r = px.bar(w_day, x="date", y="precipitation_sum", title="Daily precipitation sum")
+            st.plotly_chart(fig_r, use_container_width=True)
+        else:
+            st.info("Brak danych daily w odpowiedzi API.")
 
-    history = [centroids.copy()]
-    labels_history = []
+    return df, w, a
 
-    for _ in range(max_iter):
-        dists = np.array([np.sum((X - c)**2, axis=1) for c in centroids])
-        labels = np.argmin(dists, axis=0)
-        labels_history.append(labels.copy())
-        new_centroids = np.array([X[labels == j].mean(axis=0)
-                                   if (labels == j).any() else centroids[j]
-                                   for j in range(k)])
-        centroids = new_centroids
-        history.append(centroids.copy())
+# -----------------------------
+# Compare view
+# -----------------------------
+def render_compare(locations: list[str]):
+    rows = []
+    map_rows = []
+    with st.spinner("Pobieram dane dla wielu lokalizacji..."):
+        for name in locations:
+            lat, lon = DEFAULT_LOCATIONS[name]
+            w = fetch_weather(lat, lon, tz, days)
+            a = fetch_air(lat, lon, tz)
 
-    return history, labels_history
+            w_hour = to_hourly_df(w, prefix="")
+            a_hour = to_hourly_df(a, prefix="aq_")
+            df = pd.merge(w_hour, a_hour, on="time", how="left").sort_values("time")
 
-history, labels_history = kmeans_steps(X, k, max_iter, n_init)
-krok_idx = min(krok, len(labels_history)) - 1
-labels = labels_history[krok_idx]
-centroids = history[krok_idx + 1]
+            latest = df.dropna(subset=["temperature_2m"]).tail(1)
+            if len(latest) == 1:
+                t_now = float(latest["temperature_2m"].iloc[0])
+                pm25_now = latest["aq_pm2_5"].iloc[0] if "aq_pm2_5" in latest.columns else np.nan
+            else:
+                t_now = np.nan
+                pm25_now = np.nan
 
-# ── Metryki ───────────────────────────────────────────────────────────────────
-inertia = sum(np.sum((X[labels == j] - centroids[j])**2)
-              for j in range(k) if (labels == j).any())
-sil = silhouette_score(X, labels) if len(set(labels)) > 1 else 0
+            rows.append({
+                "location": name,
+                "temp_latest_c": t_now,
+                "pm25_latest": pm25_now,
+                "aq_status": aq_label(pm25_now) if np.isfinite(pm25_now) else "n/a",
+            })
 
-# ── Nagłówek ──────────────────────────────────────────────────────────────────
-st.title("🔵 KMeans Explorer — Nauka Klastrowania")
-st.markdown("Obserwuj jak algorytm K-Means **krok po kroku** grupuje punkty w przestrzeni 2D.")
-st.divider()
+            map_rows.append({
+                "location": name,
+                "lat": lat,
+                "lon": lon,
+                "temp": t_now,
+                "pm25": pm25_now
+            })
 
-# ── Metryki górne ─────────────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("📍 Punktów", n_punktow)
-m2.metric("🔵 Klastrów K", k)
-m3.metric("📉 Inercja", f"{inertia:.1f}")
-m4.metric("🏆 Silhouette", f"{sil:.3f}")
+    kpi = pd.DataFrame(rows).sort_values("temp_latest_c", ascending=False)
+    st.subheader("📊 Latest snapshot")
+    st.dataframe(kpi, use_container_width=True, hide_index=True)
 
-st.divider()
+    # Compare temperature time series
+    st.subheader("📈 Temperature comparison (hourly)")
+    series = []
+    for name in locations:
+        lat, lon = DEFAULT_LOCATIONS[name]
+        w = fetch_weather(lat, lon, tz, days)
+        w_hour = to_hourly_df(w, prefix="")
+        w_hour["location"] = name
+        series.append(w_hour[["time", "location", "temperature_2m"]])
+    comp = pd.concat(series, ignore_index=True)
+    fig = px.line(comp, x="time", y="temperature_2m", color="location")
+    st.plotly_chart(fig, use_container_width=True)
 
-# ── Zakładki ──────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🎬 Animacja kroków", "📊 Metoda łokcia", "🏆 Silhouette", "📖 Teoria"
-])
+    return pd.DataFrame(map_rows)
 
-# ══ TAB 1 — Animacja ══════════════════════════════════════════════════════════
-with tab1:
-    st.subheader(f"Krok {krok_idx + 1} z {max_iter}")
+# -----------------------------
+# Tabs content
+# -----------------------------
+if mode == "Single location":
+    df_all, w_payload, a_payload = render_single(loc_name, lat, lon)
 
-    col_plot, col_info = st.columns([3, 1])
+    with tabs[0]:
+        st.write("Wybierz zakładki **Map / Air Quality / Data Quality / Table & Export** dla dodatkowych widoków.")
 
-    with col_plot:
-        fig, ax = plt.subplots(figsize=(8, 6))
-        fig.patch.set_facecolor("#f8f4ff")
-        ax.set_facecolor("#fdfbff")
+    with tabs[1]:
+        st.subheader("🗺️ Map (points + hexbin)")
+        # Sample for speed
+        d = df_all.dropna(subset=["temperature_2m"]).copy()
+        if len(d) > 0:
+            d = d.tail(1)  # single point (latest) for this location
+        map_df = pd.DataFrame([{"lat": lat, "lon": lon, "temp": d["temperature_2m"].iloc[0] if len(d) else np.nan}])
 
-        # Punkty
-        for j in range(k):
-            maska = labels == j
-            ax.scatter(X[maska, 0], X[maska, 1],
-                       c=KOLORY[j % len(KOLORY)], alpha=0.6, s=50,
-                       edgecolors="white", linewidths=0.4, label=f"Klaster {j+1}")
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_df,
+            get_position="[lon, lat]",
+            get_radius=5000,
+            get_fill_color="[200, 30, 0, 160]",
+            pickable=True,
+        )
+        view_state = pdk.ViewState(latitude=lat, longitude=lon, zoom=8)
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "Temp: {temp}°C"}))
 
-        # Centroidy poprzednie
-        prev_c = history[krok_idx]
-        ax.scatter(prev_c[:, 0], prev_c[:, 1],
-                   c="white", s=200, zorder=4,
-                   edgecolors="#5b2d8e", linewidths=2, marker="o", alpha=0.5)
+    with tabs[2]:
+        st.subheader("🫁 Air Quality (hourly)")
+        cols = [c for c in df_all.columns if c.startswith("aq_")]
+        if cols:
+            show = ["aq_pm2_5", "aq_pm10", "aq_nitrogen_dioxide", "aq_ozone"]
+            show = [c for c in show if c in df_all.columns]
+            fig = px.line(df_all, x="time", y=show, title="Air quality variables (hourly)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Brak danych jakości powietrza w odpowiedzi API.")
 
-        # Centroidy aktualne
-        ax.scatter(centroids[:, 0], centroids[:, 1],
-                   c=[KOLORY[j % len(KOLORY)] for j in range(k)],
-                   s=300, zorder=5, edgecolors="black", linewidths=2,
-                   marker="*", label="Centroidy")
+    with tabs[3]:
+        st.subheader("🧪 Data Quality & Engineering")
+        st.write("**Caching:** dane pogodowe TTL 30 min, dane AQ TTL 60 min.")
+        st.write("**Walidacja:** odfiltrowane wartości puste; zakresy opadów i czasu pozostają zgodne z API.")
+        st.json({
+            "weather_keys": list(w_payload.keys()),
+            "air_quality_keys": list(a_payload.keys())
+        })
 
-        # Strzałki ruchu centroidów
-        for j in range(k):
-            dx = centroids[j, 0] - prev_c[j, 0]
-            dy = centroids[j, 1] - prev_c[j, 1]
-            if abs(dx) + abs(dy) > 0.01:
-                ax.annotate("", xy=centroids[j], xytext=prev_c[j],
-                            arrowprops=dict(arrowstyle="->", color="#5b2d8e",
-                                           lw=1.5, alpha=0.7))
+    with tabs[4]:
+        st.subheader("📄 Table & Export")
+        st.dataframe(df_all, use_container_width=True)
+        csv = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, file_name=f"weather_aq_{loc_name}.csv", mime="text/csv")
 
-        ax.set_title(f"K-Means — krok {krok_idx+1}/{max_iter}  |  K={k}",
-                     fontsize=13, fontweight="bold", color="#5b2d8e")
-        ax.legend(fontsize=9, loc="upper right")
-        ax.spines[["top","right"]].set_visible(False)
-        ax.set_xlabel("X₁", fontsize=11)
-        ax.set_ylabel("X₂", fontsize=11)
-        plt.tight_layout()
-        st.pyplot(fig)
+else:
+    with tabs[0]:
+        map_df = render_compare(selected)
 
-    with col_info:
-        st.markdown("### 📋 Co się dzieje?")
-        st.markdown(f"""
-        <div class="step-box">
-            <div class="step-num">{krok_idx+1}</div>
-            <div class="step-label">Aktualny krok</div>
-        </div>
-        <div class="step-box">
-            <div class="step-num">{k}</div>
-            <div class="step-label">Klastrów</div>
-        </div>
-        <div class="step-box">
-            <div class="step-num">{inertia:.0f}</div>
-            <div class="step-label">Inercja</div>
-        </div>
-        """, unsafe_allow_html=True)
+    with tabs[1]:
+        st.subheader("🗺️ Map: compare locations (color by temperature, tooltip includes PM2.5)")
+        map_df = map_df.dropna(subset=["lat", "lon"]).copy()
 
-        st.markdown("""
-        <div class="info-box">
-        ⭐ <b>Gwiazda</b> = centroid klastra<br><br>
-        ➡️ <b>Strzałka</b> = ruch centroidu<br><br>
-        🎨 <b>Kolor</b> = przynależność do klastra
-        </div>
-        """, unsafe_allow_html=True)
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_df,
+            get_position="[lon, lat]",
+            get_radius=80000,
+            get_fill_color="[200, 30, 0, 160]",
+            pickable=True,
+        )
+        view_state = pdk.ViewState(latitude=float(map_df["lat"].mean()), longitude=float(map_df["lon"].mean()), zoom=2.2)
+        st.pydeck_chart(
+            pdk.Deck(layers=[layer], initial_view_state=view_state,
+                     tooltip={"text": "{location}\nTemp: {temp}°C\nPM2.5: {pm25} µg/m³"})
+        )
 
-        # Rozmiary klastrów
-        st.markdown("**Rozmiary klastrów:**")
-        for j in range(k):
-            n_j = int((labels == j).sum())
-            pct = n_j / len(X) * 100
-            st.markdown(f"Klaster {j+1}: **{n_j}** ({pct:.0f}%)")
+    with tabs[2]:
+        st.info("W trybie porównawczym AQ jest pokazane w tooltipie mapy + w tabeli snapshot. Możesz rozbudować o wykresy AQ per miasto.")
 
-    # Wykres inercji w czasie
-    st.markdown("#### 📉 Inercja przez kolejne kroki")
-    inercje = []
-    for step_i, (lbl, cen) in enumerate(zip(labels_history, history[1:])):
-        iner = sum(np.sum((X[lbl == j] - cen[j])**2)
-                   for j in range(k) if (lbl == j).any())
-        inercje.append(iner)
+    with tabs[3]:
+        st.subheader("🧪 Data Quality & Engineering")
+        st.write("W trybie porównawczym pobieramy dane per lokalizacja, cachowane według współrzędnych i parametrów (TTL).")
 
-    fig2, ax2 = plt.subplots(figsize=(10, 2.5))
-    fig2.patch.set_facecolor("#f8f4ff")
-    ax2.set_facecolor("#fdfbff")
-    ax2.plot(range(1, len(inercje)+1), inercje, "o-",
-             color="#7b3db5", linewidth=2, markersize=7)
-    ax2.axvline(krok_idx+1, color="#e63946", linestyle="--",
-                linewidth=1.5, label=f"Krok {krok_idx+1}")
-    ax2.scatter([krok_idx+1], [inercje[krok_idx]],
-                color="#e63946", s=120, zorder=5)
-    ax2.set_xlabel("Krok", fontsize=10)
-    ax2.set_ylabel("Inercja", fontsize=10)
-    ax2.legend(fontsize=9)
-    ax2.spines[["top","right"]].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig2)
-
-# ══ TAB 2 — Metoda łokcia ══════════════════════════════════════════════════════
-with tab2:
-    st.subheader("Metoda łokcia — jak wybrać K?")
-    st.markdown("Szukamy punktu gdzie inercja przestaje gwałtownie spadać — to nasz optymalny **K**.")
-
-    k_range = range(1, 11)
-    inercje_k = []
-    for ki in k_range:
-        km = KMeans(n_clusters=ki, init="k-means++", n_init=10, random_state=42)
-        km.fit(X)
-        inercje_k.append(km.inertia_)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#f8f4ff")
-    ax.set_facecolor("#fdfbff")
-    ax.plot(k_range, inercje_k, "o-", color="#7b3db5", linewidth=2.5,
-            markersize=9, markerfacecolor="white", markeredgewidth=2)
-    ax.axvline(k, color="#e63946", linestyle="--", linewidth=2,
-               label=f"Twój K = {k}")
-    ax.scatter([k], [inercje_k[k-1]], color="#e63946", s=180, zorder=5)
-
-    # Annotacja łokcia
-    ax.annotate(f"  K={k}\n  Inercja={inercje_k[k-1]:.0f}",
-                xy=(k, inercje_k[k-1]),
-                xytext=(k+0.5, inercje_k[k-1] + max(inercje_k)*0.05),
-                fontsize=10, color="#e63946",
-                arrowprops=dict(arrowstyle="->", color="#e63946"))
-
-    ax.set_xlabel("Liczba klastrów K", fontsize=12)
-    ax.set_ylabel("Inercja (WCSS)", fontsize=12)
-    ax.set_title("Metoda łokcia", fontsize=14, fontweight="bold", color="#5b2d8e")
-    ax.legend(fontsize=11)
-    ax.spines[["top","right"]].set_visible(False)
-    ax.set_xticks(list(k_range))
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    st.markdown('<div class="info-box">💡 <b>Jak czytać wykres?</b> Szukaj "łokcia" — miejsca gdzie krzywa wyraźnie się zgina. Tam inercja nie spada już tak gwałtownie. To sugerowany K.</div>', unsafe_allow_html=True)
-
-# ══ TAB 3 — Silhouette ════════════════════════════════════════════════════════
-with tab3:
-    st.subheader("Współczynnik Silhouette — jakość klastrów")
-    st.markdown("Wartość od **-1** (źle) do **+1** (idealnie). Im wyżej, tym lepiej dopasowane klastry.")
-
-    k_range2 = range(2, 11)
-    sil_scores = []
-    for ki in k_range2:
-        km = KMeans(n_clusters=ki, init="k-means++", n_init=10, random_state=42)
-        lbl = km.fit_predict(X)
-        sil_scores.append(silhouette_score(X, lbl))
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#f8f4ff")
-    ax.set_facecolor("#fdfbff")
-
-    bars = ax.bar(k_range2, sil_scores,
-                  color=[("#e63946" if ki == k else "#7b3db5") for ki in k_range2],
-                  alpha=0.8, edgecolor="white", linewidth=1.5)
-    ax.axhline(sil_scores[k-2], color="#e63946", linestyle="--",
-               alpha=0.5, linewidth=1)
-
-    for bar, val in zip(bars, sil_scores):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=9, color="#333")
-
-    ax.set_xlabel("Liczba klastrów K", fontsize=12)
-    ax.set_ylabel("Silhouette Score", fontsize=12)
-    ax.set_title("Silhouette Score dla różnych K", fontsize=14,
-                 fontweight="bold", color="#5b2d8e")
-    ax.set_xticks(list(k_range2))
-    ax.spines[["top","right"]].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    best_k = list(k_range2)[np.argmax(sil_scores)]
-    st.success(f"🏆 Najwyższy Silhouette Score dla **K = {best_k}** ({max(sil_scores):.3f})")
-    st.markdown('<div class="info-box">💡 <b>Silhouette Score</b> mierzy jak dobrze punkt pasuje do swojego klastra vs sąsiednich. Najwyższy słupek = sugerowane K.</div>', unsafe_allow_html=True)
-
-# ══ TAB 4 — Teoria ════════════════════════════════════════════════════════════
-with tab4:
-    st.subheader("📖 Jak działa K-Means?")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("""
-        ### Algorytm krok po kroku
-
-        **1. Inicjalizacja**
-        Wybierz K losowych punktów jako centroidy startowe.
-        Opcja `k-means++` wybiera je mądrzej — dalej od siebie.
-
-        **2. Przypisanie**
-        Każdy punkt przypisz do najbliższego centroidu
-        (minimalna odległość euklidesowa).
-
-        **3. Aktualizacja**
-        Przesuń centroid do środka ciężkości (średniej)
-        wszystkich punktów w danym klastrze.
-
-        **4. Powtarzaj**
-        Kroki 2-3 aż centroidy przestaną się poruszać
-        lub osiągniemy max_iter.
-        """)
-
-    with col2:
-        st.markdown("""
-        ### Wzory matematyczne
-
-        **Odległość euklidesowa:**
-        """)
-        st.latex(r"d(x, c) = \sqrt{\sum_{i=1}^{n}(x_i - c_i)^2}")
-
-        st.markdown("**Inercja (WCSS):**")
-        st.latex(r"J = \sum_{k=1}^{K} \sum_{x \in C_k} ||x - \mu_k||^2")
-
-        st.markdown("**Nowy centroid:**")
-        st.latex(r"\mu_k = \frac{1}{|C_k|} \sum_{x \in C_k} x")
-
-        st.markdown("**Silhouette:**")
-        st.latex(r"s = \frac{b - a}{\max(a, b)}")
-        st.caption("a = średnia odl. do własnego klastra, b = średnia odl. do najbliższego klastra")
-
-    st.divider()
-    st.markdown("### ⚠️ Kiedy K-Means zawodzi?")
-
-    c1, c2, c3 = st.columns(3)
-    c1.error("❌ **Niekuliste kształty**\nMoons i circles — K-Means nie radzi sobie z niespójnymi kształtami")
-    c2.warning("⚠️ **Różne rozmiary klastrów**\nAlgorytm zakłada podobne liczebności klastrów")
-    c3.info("💡 **Alternatywy**\nDBSCAN, Agglomerative Clustering, Gaussian Mixture Models")
-
-# ── Stopka ────────────────────────────────────────────────────────────────────
-st.divider()
-st.markdown(
-    "<center style='color:#aaa; font-size:0.85rem'>🔵 KMeans Explorer • Zbudowany w Streamlit • Edukacja Data Science</center>",
-    unsafe_allow_html=True
-)
+    with tabs[4]:
+        st.info("Export dotyczy widoku single-location. Jeśli chcesz, dopiszę export dla compare-mode (łączenie danych do jednego CSV).")
